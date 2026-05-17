@@ -179,61 +179,110 @@ def extract_members(win, max_depth: int = 30) -> tuple[list[str], list[tuple[str
     return deduped, diag
 
 
+def _is_member_like(name: str) -> bool:
+    if not name:
+        return False
+    name = name.strip()
+    if len(name) > 30 or len(name) < 1:
+        return False
+    if any(n in name for n in _NOISE):
+        return False
+    # 过滤纯标点 / 纯英文菜单词
+    common_menu = {
+        "确定", "取消", "关闭", "最小化", "最大化", "退出", "返回", "下一步", "上一步",
+        "保存", "删除", "编辑", "复制", "粘贴", "剪切", "全选", "新建", "打开",
+        "聊天", "通讯录", "收藏", "朋友圈", "视频号", "看一看", "设置", "我的",
+        "更多", "全部", "群公告", "群名片", "群管理", "群二维码",
+        "OK", "Cancel", "Close", "Save", "More", "Settings",
+    }
+    if name in common_menu:
+        return False
+    return True
+
+
+def _snapshot_desktop(auto, max_depth: int = 18) -> set[str]:
+    """快照桌面树上所有'类项'控件的名字。用于 before/after 差集。"""
+    seen: set[str] = set()
+    try:
+        desktop = auto.GetRootControl()
+    except Exception:
+        return seen
+
+    def walk(ctrl, depth):
+        if depth > max_depth:
+            return
+        try:
+            ctype = ctrl.ControlTypeName
+            nm = (ctrl.Name or "").strip()
+        except Exception:
+            return
+        if ctype in _ITEM_TYPES and nm:
+            seen.add(nm)
+        try:
+            for c in ctrl.GetChildren():
+                walk(c, depth + 1)
+        except Exception:
+            pass
+
+    walk(desktop, 0)
+    return seen
+
+
 def extract_via_at_popup(auto, pyautogui, pyperclip, char_delay: float, log_fn) -> list[str]:
     """@ 弹窗扫描法（适用于 微信 4.x）：
-    在聊天输入框输入 @ 触发成员选择弹窗，按 ↓ 翻遍所有成员收集 Name。
-    要求用户已点击聊天输入框，光标在里面。
+    用 before/after 差集隔离弹窗内容：先快照桌面所有 UI 项，按 @ 后再快照，
+    只取新出现的项作为成员候选。然后按 ↓ 翻屏继续收集。
     """
+    log_fn("  快照按 @ 之前的桌面 UI 树（建立基线）…")
+    baseline = _snapshot_desktop(auto)
+    log_fn(f"  基线: {len(baseline)} 个已有项")
+
     log_fn("  按下 @ 触发成员弹窗…")
     pyautogui.write("@", interval=0)
     time.sleep(0.7)
 
     members: list[str] = []
-    seen: set[str] = set()
-    desktop = auto.GetRootControl()
+    seen_members: set[str] = set()
+    all_seen: set[str] = set(baseline)
 
-    def collect_visible() -> int:
-        before = len(seen)
-        def walk(ctrl, depth):
-            if depth > 18:
-                return
-            try:
-                ctype = ctrl.ControlTypeName
-                nm = (ctrl.Name or "").strip()
-            except Exception:
-                return
-            if ctype in _ITEM_TYPES and nm and len(nm) <= 30:
-                if not any(n in nm for n in _NOISE):
-                    if nm not in seen:
-                        seen.add(nm)
-                        members.append(nm)
-            try:
-                for c in ctrl.GetChildren():
-                    walk(c, depth + 1)
-            except Exception:
-                pass
-        walk(desktop, 0)
-        return len(seen) - before
+    def collect_new() -> int:
+        snap = _snapshot_desktop(auto)
+        diff = snap - all_seen
+        all_seen.update(snap)
+        added = 0
+        for nm in diff:
+            if _is_member_like(nm) and nm not in seen_members:
+                seen_members.add(nm)
+                members.append(nm)
+                added += 1
+        return added
 
-    added = collect_visible()
-    log_fn(f"  初始弹窗可见 {added} 项")
+    added = collect_new()
+    log_fn(f"  按 @ 后弹窗新增 {added} 个候选")
 
-    # 翻页：每次按 ↓ 一两次，扫描，直到连续多次没有新成员
+    if added == 0:
+        log_fn("  [!] 弹窗未出现或被基线全过滤了；可能输入框没获焦")
+
+    # 翻页：每次 ↓ 一下，收集新出现的
     stalled = 0
-    max_iter = 500  # 防死循环
+    max_iter = 800
     for i in range(max_iter):
         pyautogui.press("down")
-        time.sleep(char_delay * 0.5)
-        added = collect_visible()
+        time.sleep(max(0.05, char_delay * 0.4))
+        added = collect_new()
         if added == 0:
             stalled += 1
-            if stalled >= 6:
+            if stalled >= 10:
                 break
         else:
             stalled = 0
+            if (i + 1) % 20 == 0:
+                log_fn(f"    已收集 {len(members)} 个…")
 
-    log_fn(f"  共收集 {len(members)} 项，关闭弹窗…")
-    # 关闭弹窗并清掉输入框里残留的 @ 字符
+    log_fn(f"  共收集 {len(members)} 项，清理弹窗…")
+    pyautogui.press("escape")
+    time.sleep(char_delay)
+    # 再来一次 ESC 兜底，并退格删掉输入框里残留的 @
     pyautogui.press("escape")
     time.sleep(char_delay)
     pyautogui.press("backspace")
