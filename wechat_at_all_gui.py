@@ -109,66 +109,161 @@ def find_wechat_window(auto) -> object | None:
     return None
 
 
-def extract_members(win, max_depth: int = 25) -> tuple[list[str], list[tuple[str, int]]]:
-    """走 UI 树，找含最多 ListItem 的 ListControl 作为成员列表。
+_CONTAINER_TYPES = ("ListControl", "GroupControl", "PaneControl", "DocumentControl", "TableControl")
+_ITEM_TYPES = ("ListItemControl", "TreeItemControl", "MenuItemControl", "TextControl", "ButtonControl")
+
+
+def extract_members(win, max_depth: int = 30) -> tuple[list[str], list[tuple[str, int]]]:
+    """走 UI 树，找含最多"看起来像姓名的子项"的容器作为成员列表。
+    对 WeChat 3.x: 找 ListControl + ListItemControl
+    对 微信 4.x (Qt): 找任意容器下含较多有名字的子项的那个
     返回 (成员名单, 候选诊断信息)。"""
-    candidates: list[tuple[object, list[object]]] = []
+    candidates: list[tuple[object, list[str]]] = []
+
+    def looks_like_member_name(name: str) -> bool:
+        if not name or len(name) > 30:
+            return False
+        if any(n in name for n in _NOISE):
+            return False
+        return True
 
     def walk(ctrl, depth: int) -> None:
         if depth > max_depth:
             return
         try:
-            children = ctrl.GetChildren()
-        except Exception:
-            return
-        try:
             ctype = ctrl.ControlTypeName
         except Exception:
             ctype = ""
-        if ctype == "ListControl":
-            items = []
+        try:
+            children = ctrl.GetChildren()
+        except Exception:
+            children = []
+
+        if ctype in _CONTAINER_TYPES and children:
+            names = []
             for c in children:
                 try:
-                    if c.ControlTypeName == "ListItemControl" and (c.Name or "").strip():
-                        items.append(c)
+                    cctype = c.ControlTypeName
+                    nm = (c.Name or "").strip()
                 except Exception:
-                    pass
-            if items:
-                candidates.append((ctrl, items))
+                    continue
+                if cctype in _ITEM_TYPES and looks_like_member_name(nm):
+                    names.append(nm)
+            if len(names) >= 3:  # 至少 3 个才算候选
+                candidates.append((ctrl, names))
+
         for c in children:
             walk(c, depth + 1)
 
     walk(win, 0)
 
     diag = []
-    for ctrl, items in candidates:
+    for ctrl, names in candidates:
         try:
-            diag.append((ctrl.Name or ctrl.ClassName or "?", len(items)))
+            label = f"{ctrl.ControlTypeName}/{(ctrl.Name or ctrl.ClassName or '?')[:20]}"
         except Exception:
-            diag.append(("?", len(items)))
+            label = "?"
+        diag.append((label, len(names)))
 
     if not candidates:
         return [], diag
 
-    # 选 ListItem 数最多的那个
     candidates.sort(key=lambda x: -len(x[1]))
-    _, best_items = candidates[0]
-    names: list[str] = []
-    for item in best_items:
-        nm = (item.Name or "").strip()
-        if not nm:
-            continue
-        if any(n in nm for n in _NOISE):
-            continue
-        names.append(nm)
-    # 去重保序
+    _, best_names = candidates[0]
     seen = set()
     deduped = []
-    for n in names:
+    for n in best_names:
         if n not in seen:
             seen.add(n)
             deduped.append(n)
     return deduped, diag
+
+
+def extract_via_at_popup(auto, pyautogui, pyperclip, char_delay: float, log_fn) -> list[str]:
+    """@ 弹窗扫描法（适用于 微信 4.x）：
+    在聊天输入框输入 @ 触发成员选择弹窗，按 ↓ 翻遍所有成员收集 Name。
+    要求用户已点击聊天输入框，光标在里面。
+    """
+    log_fn("  按下 @ 触发成员弹窗…")
+    pyautogui.write("@", interval=0)
+    time.sleep(0.7)
+
+    members: list[str] = []
+    seen: set[str] = set()
+    desktop = auto.GetRootControl()
+
+    def collect_visible() -> int:
+        before = len(seen)
+        def walk(ctrl, depth):
+            if depth > 18:
+                return
+            try:
+                ctype = ctrl.ControlTypeName
+                nm = (ctrl.Name or "").strip()
+            except Exception:
+                return
+            if ctype in _ITEM_TYPES and nm and len(nm) <= 30:
+                if not any(n in nm for n in _NOISE):
+                    if nm not in seen:
+                        seen.add(nm)
+                        members.append(nm)
+            try:
+                for c in ctrl.GetChildren():
+                    walk(c, depth + 1)
+            except Exception:
+                pass
+        walk(desktop, 0)
+        return len(seen) - before
+
+    added = collect_visible()
+    log_fn(f"  初始弹窗可见 {added} 项")
+
+    # 翻页：每次按 ↓ 一两次，扫描，直到连续多次没有新成员
+    stalled = 0
+    max_iter = 500  # 防死循环
+    for i in range(max_iter):
+        pyautogui.press("down")
+        time.sleep(char_delay * 0.5)
+        added = collect_visible()
+        if added == 0:
+            stalled += 1
+            if stalled >= 6:
+                break
+        else:
+            stalled = 0
+
+    log_fn(f"  共收集 {len(members)} 项，关闭弹窗…")
+    # 关闭弹窗并清掉输入框里残留的 @ 字符
+    pyautogui.press("escape")
+    time.sleep(char_delay)
+    pyautogui.press("backspace")
+    time.sleep(char_delay)
+    return members
+
+
+def dump_tree(win, max_depth: int = 30, max_lines: int = 2000) -> list[str]:
+    """诊断用：dump WeChat 窗口完整 UI 树。"""
+    lines = []
+    def walk(ctrl, depth):
+        if len(lines) >= max_lines:
+            return
+        if depth > max_depth:
+            return
+        try:
+            ctype = ctrl.ControlTypeName
+            nm = ctrl.Name or ""
+            cls = getattr(ctrl, "ClassName", "") or ""
+        except Exception:
+            return
+        if nm.strip() or ctype in _CONTAINER_TYPES + _ITEM_TYPES:
+            lines.append(f"{'  '*depth}{ctype} '{nm[:40]}' [{cls}]")
+        try:
+            for c in ctrl.GetChildren():
+                walk(c, depth + 1)
+        except Exception:
+            pass
+    walk(win, 0)
+    return lines
 
 
 # ---------- GUI ----------
@@ -208,9 +303,12 @@ class App:
         scan_frm = ttk.Frame(frm)
         scan_frm.grid(row=1, column=0, columnspan=4, sticky="ew", **pad)
         ttk.Label(scan_frm, text="① 群成员名单:").pack(side="left")
-        self.scan_btn = ttk.Button(scan_frm, text="🔍 扫描群成员", command=self._start_scan)
-        self.scan_btn.pack(side="left", padx=8)
-        ttk.Label(scan_frm, text="扫描前先在微信里把成员面板展开").pack(side="left", padx=4)
+        self.scan_btn = ttk.Button(scan_frm, text="🔍 扫描(面板)", command=self._start_scan)
+        self.scan_btn.pack(side="left", padx=4)
+        self.scan_at_btn = ttk.Button(scan_frm, text="🔍 扫描(@弹窗,推荐4.x)", command=self._start_scan_at)
+        self.scan_at_btn.pack(side="left", padx=4)
+        self.diag_btn = ttk.Button(scan_frm, text="🩺 全树诊断", command=self._start_dump)
+        self.diag_btn.pack(side="left", padx=4)
         ttk.Button(scan_frm, text="从 txt 导入…", command=self._pick_members_file).pack(side="right", padx=4)
 
         # 成员名单 textarea
@@ -399,6 +497,126 @@ class App:
     def _fill_members(self, text: str) -> None:
         self.members_text.delete("1.0", "end")
         self.members_text.insert("1.0", text)
+
+    # ---- 扫描 @ 弹窗（适用 微信 4.x Qt）----
+    def _start_scan_at(self) -> None:
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning(APP_TITLE, "上一个任务还在运行。")
+            return
+        params = self._read_params()
+        if params is None:
+            return
+        _, char_delay, _, countdown = params
+        if not messagebox.askyesno(
+            APP_TITLE,
+            "@ 弹窗扫描法（推荐用于微信 4.x）：\n\n"
+            "1. 微信里打开目标群\n"
+            "2. 点击聊天输入框（光标在里面）\n"
+            "3. 别动键盘鼠标\n\n"
+            f"点确定后 {countdown} 秒倒计时，程序会自动按 @ 触发成员弹窗，"
+            "按 ↓ 翻遍全员收集，最后清掉 @ 字符。",
+        ):
+            return
+        self.cancel_event.clear()
+        self.scan_at_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.worker = threading.Thread(
+            target=self._do_scan_at, args=(countdown, char_delay), daemon=True
+        )
+        self.worker.start()
+
+    def _do_scan_at(self, countdown: int, char_delay: float) -> None:
+        try:
+            auto, err = _load_uia()
+            if auto is None:
+                self._log(f"[错误] 缺少 uiautomation: {err}"); return
+            pyautogui, pyperclip, err = _load_input_deps()
+            if pyautogui is None:
+                self._log(f"[错误] 缺少依赖: {err}"); return
+            pyautogui.FAILSAFE = True
+            pyautogui.PAUSE = char_delay
+
+            for s in range(countdown, 0, -1):
+                if self.cancel_event.is_set():
+                    self._log("已取消。"); return
+                self._log(f"  倒计时 {s}…切到微信群聊点击聊天输入框！")
+                self.root.after(0, lambda v=s: self.status_var.set(f"@ 扫描倒计时 {v}…"))
+                time.sleep(1)
+
+            members = extract_via_at_popup(auto, pyautogui, pyperclip, char_delay, self._log)
+            if not members:
+                self._log("[错误] @ 弹窗未收集到任何成员。可能原因：")
+                self._log("  - 倒计时期间没切到微信 / 没点输入框")
+                self._log("  - @ 字符未触发弹窗（输入框未获焦）")
+                return
+            self._log(f"✓ 收集到 {len(members)} 个候选名单，已填入下方")
+            text = "\n".join(members)
+            self.root.after(0, lambda: self._fill_members(text))
+        except Exception as e:
+            self._log(f"[错误] {type(e).__name__}: {e}")
+            self._log(traceback.format_exc())
+        finally:
+            self.root.after(0, lambda: self.scan_at_btn.configure(state="normal"))
+            self.root.after(0, lambda: self.stop_btn.configure(state="disabled"))
+            self.root.after(0, lambda: self.status_var.set("就绪"))
+
+    # ---- 全树诊断 ----
+    def _start_dump(self) -> None:
+        if self.worker and self.worker.is_alive():
+            messagebox.showwarning(APP_TITLE, "上一个任务还在运行。")
+            return
+        params = self._read_params()
+        if params is None:
+            return
+        _, _, _, countdown = params
+        if not messagebox.askyesno(
+            APP_TITLE,
+            "诊断模式：将 dump 微信窗口完整 UI 树到 ui_tree_dump.txt\n"
+            "用来排查为什么扫描不到成员。\n\n"
+            f"点确定后 {countdown} 秒倒计时，请把微信群聊面板调到目标状态（最好展开成员面板）。",
+        ):
+            return
+        self.cancel_event.clear()
+        self.diag_btn.configure(state="disabled")
+        self.stop_btn.configure(state="normal")
+        self.worker = threading.Thread(target=self._do_dump, args=(countdown,), daemon=True)
+        self.worker.start()
+
+    def _do_dump(self, countdown: int) -> None:
+        try:
+            auto, err = _load_uia()
+            if auto is None:
+                self._log(f"[错误] 缺少 uiautomation: {err}"); return
+            for s in range(countdown, 0, -1):
+                if self.cancel_event.is_set():
+                    self._log("已取消。"); return
+                self._log(f"  倒计时 {s}…让微信窗口保持目标状态在前台！")
+                self.root.after(0, lambda v=s: self.status_var.set(f"诊断倒计时 {v}…"))
+                time.sleep(1)
+            win = find_wechat_window(auto)
+            if win is None:
+                self._log("[错误] 找不到微信窗口"); return
+            self._log(f"  找到窗口: {getattr(win, 'ClassName', '?')} / {getattr(win, 'Name', '?')}")
+            self._log("dump UI 树中（最多 2000 行）…")
+            lines = dump_tree(win)
+            import os
+            out_path = os.path.join(os.path.expanduser("~"), "ui_tree_dump.txt")
+            try:
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(lines))
+                self._log(f"✓ 已写入 {out_path}（{len(lines)} 行）")
+            except Exception as e:
+                self._log(f"  写文件失败: {e}")
+            self._log("--- 前 80 行预览 ---")
+            for ln in lines[:80]:
+                self._log(ln)
+        except Exception as e:
+            self._log(f"[错误] {type(e).__name__}: {e}")
+            self._log(traceback.format_exc())
+        finally:
+            self.root.after(0, lambda: self.diag_btn.configure(state="normal"))
+            self.root.after(0, lambda: self.stop_btn.configure(state="disabled"))
+            self.root.after(0, lambda: self.status_var.set("就绪"))
 
     # ---- 预览 / 发送 ----
     def _targets(self) -> list[str] | None:
